@@ -1,0 +1,101 @@
+-- DPI/ETH Uni v3 Analytics: https://info.uniswap.org/#/pools/0x9359c87b38dd25192c5f2b07b351ac91c90e6ca7
+-- DPI/ETH Uni v2 Analytics: https://v2.info.uniswap.org/pair/0x4d5ef58aac27d99935e5b6b4a6778ff292059991
+
+-- DPI/ETH Uni v3: https://etherscan.io/address/0x9359c87b38dd25192c5f2b07b351ac91c90e6ca7
+-- DPI/ETH Uni v2: https://etherscan.io/address/0x4d5ef58aac27d99935e5b6b4a6778ff292059991
+
+----- PROMPT -----
+
+-- In August 2021, the Index Coop incentived (via a staking contract) the movement of liquidity from Uniswap v2 -> Uniswap v3 in order
+-- to take advantage of the increased capital efficiency of Uniswap v3. We are interested in analyzing this liquidity migration. This
+-- exercise is intended to introduce you to a few of the important events associated with adding or removing liquidity on Uniswap, as well
+-- as some initial data checks (via UNIONs).
+
+-- There are links above to the Uniswap v2 and v3 DPI/ETH pool analytics pages - those are interesting to explore. There are also links
+-- to the specific pool address (etherscan).
+
+-- Below, I have built out simple queries for the mint and burn events on Uniswap v2 and v3 DPI/ETH pools. Minting is done when you add liquidity
+-- and burning is when you remove liquidity. We have to join onto "ethereum.transactions" to actually get the address that is performing the action ("from").
+
+-- LP = liquidity provider
+
+-- Explore the events, and try and answer the prompts at the bottom using UNION, INTERSECT, EXCEPT
+
+----- WORK -----
+
+-- v3 events
+WITH v3_mint AS (
+    
+    SELECT
+        t."from" AS lp_address,
+        m.*
+    FROM uniswap_v3."Pair_evt_Mint" m
+    LEFT JOIN ethereum.transactions t ON m.evt_tx_hash = t.hash
+    WHERE contract_address = '\x9359c87b38dd25192c5f2b07b351ac91c90e6ca7'
+    
+    
+),
+
+v3_burn AS (
+
+    SELECT
+        t."from" AS lp_address,
+        m.*
+    FROM uniswap_v3."Pair_evt_Burn" m
+    LEFT JOIN ethereum.transactions t ON m.evt_tx_hash = t.hash
+    WHERE contract_address = '\x9359c87b38dd25192c5f2b07b351ac91c90e6ca7'
+    
+),
+
+-- v2 events
+v2_mint AS (
+
+    SELECT
+        t."from" AS lp_address,
+        m.*
+    FROM uniswap_v2."Pair_evt_Mint" m
+    LEFT JOIN ethereum.transactions t ON m.evt_tx_hash = t.hash
+    WHERE contract_address = '\x4d5ef58aac27d99935e5b6b4a6778ff292059991'
+        AND date_trunc('day', evt_block_time) >= '2021-04-01'
+
+),
+
+v2_burn AS (
+    
+    SELECT
+        t."from" AS lp_address,
+        m.*
+    FROM uniswap_v2."Pair_evt_Burn" m
+    LEFT JOIN ethereum.transactions t ON m.evt_tx_hash = t.hash
+    WHERE contract_address = '\x4d5ef58aac27d99935e5b6b4a6778ff292059991'
+        AND date_trunc('day', evt_block_time) >= '2021-04-01'
+    
+)
+
+-- List the LP address that have minted liquidty in v2 or v3
+-- SELECT lp_address FROM v2_mint
+-- UNION
+-- SELECT lp_address FROM v3_mint
+
+-- List the LP addresses that have minted liquidity in both v2 and v3
+-- SELECT lp_address FROM v2_mint
+-- INTERSECT
+-- SELECT lp_address FROM v3_mint
+
+-- List the LP addresses that have minted on v3 and not on v2
+-- SELECT lp_address FROM v3_mint
+-- EXCEPT
+-- SELECT lp_address FROM v2_mint
+
+
+-- List the LP addresses that burned v2 liquidity in August 2021 and also minted v3 liquidity in August 2021
+-- SELECT lp_address FROM v2_burn WHERE date_trunc('day', evt_block_time) BETWEEN '08-01-2021' AND '08-30-2021'
+-- INTERSECT
+-- SELECT lp_address FROM v3_mint WHERE date_trunc('day', evt_block_time) BETWEEN '08-01-2021' AND '08-30-2021'
+
+-- List the LP addresses that have minted both v2 and v3 liquidity but have not burned v2 liquidity
+SELECT lp_address FROM v3_mint
+INTERSECT
+SELECT lp_address FROM v2_mint
+EXCEPT
+SELECT lp_address FROM v2_burn
