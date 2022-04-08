@@ -1,104 +1,6 @@
-WITH borrows AS (
-    
-    SELECT  day,
-            project,
-            token_symbol,
-            token_address, 
-            sum(amount) AS amount -- Net borrow per day
-    FROM
-    
-    (
-        SELECT  date_trunc('day', block_time) AS day,
-                project,
-                asset_address AS token_address,
-                asset_symbol AS token_symbol,
-                token_amount AS amount
-        FROM lending."borrow"
-        WHERE project = 'MakerDAO'
-
-        
-        UNION ALL
-        
-        SELECT  date_trunc('day', block_time) AS day,
-                project,
-                asset_address AS token_address,
-                asset_symbol AS token_symbol,
-                -token_amount AS amount
-        FROM lending."repay"
-        WHERE project = 'MakerDAO'
-
-    ) b
-   GROUP BY 1, 2, 3, 4
-   ),
-   outstanding_token_amount AS (
-    SELECT  day,
-            project,
-            token_address,
-            SUM(amount) OVER (PARTITION BY project, token_address ORDER BY day) AS outstanding
-    FROM borrows
-    WHERE project = 'MakerDAO'
-    ),
-    per_day AS
-(
-    SELECT  date_trunc('day', block_time) AS day,
-            project,
-            asset_address,
-            SUM(token_amount) AS collateral_change
-    FROM lending."collateral_change"
-    GROUP BY 1, 2, 3
-),
-daily_token_balance AS (
-    SELECT  day,
-            project,
-            asset_address,
-            SUM(collateral_change) OVER (PARTITION BY project, asset_address ORDER BY day) AS collateral_locked
-    FROM per_day
-    WHERE day < date_trunc('day', now())
-),
-usd_prices AS (
-    SELECT  date_trunc('day', minute) AS day,
-            contract_address AS asset_address,
-            AVG(price) AS price
-    FROM prices.usd 
-    WHERE contract_address IN (SELECT asset_address FROM daily_token_balance)
-    AND minute > now() - interval '12 months'
-    GROUP BY 1,2
-),
-all_outstanding as 
-   (
-SELECT  b.day,
-        project,
-        SUM(outstanding*p.price) AS outstanding_usd_value
-FROM outstanding_token_amount b
-LEFT JOIN usd_prices p ON p.day = b.day AND p.asset_address = b.token_address
- WHERE b.day BETWEEN '{{1 - Start Date Time}}' AND LEAST ('{{2 - Finish Date Time}}', NOW())
-AND project = 'MakerDAO'
-GROUP BY 1, 2
-),
-all_collateral as (
-SELECT  b.day,
-        project,
-        SUM(collateral_locked*p.price) AS locked_usd_value
-FROM        daily_token_balance b
-LEFT JOIN   usd_prices p ON p.day = b.day AND p.asset_address = b.asset_address
-  WHERE b.day BETWEEN '{{1 - Start Date Time}}' AND LEAST ('{{2 - Finish Date Time}}', NOW())
-AND project = 'MakerDAO'
-GROUP BY 1, 2
-),
-
-mkr as ( 
-Select  
-    o.day as mkr_day,
-    o.project, 
-    outstanding_usd_value as mkr_debt,
-    locked_usd_value as mkr_collateral
-from all_outstanding o
-left join all_collateral c on o.day = c.day
-),
-
-tokens AS (
+WITH tokens AS (
     SELECT
-        "cToken" AS contract_address,
+        "cToken" AS contract_address, --identifiying the interest bearing ctokens and naming then both token and ctoken for display purposes. Then there is a decimal conversion to ensure correct price conversions.
         CASE
             WHEN "cToken" = '\xe65cdb6479bac1e22340e4e755fae7e509ecd06c' THEN 'AAVE'
             WHEN "cToken" = '\x6c8c6b02e7b2be14d4fa6022dfd6d75921d90e4e' THEN 'BAT'
@@ -166,7 +68,7 @@ tokens AS (
     FROM compound_v2."Unitroller_evt_MarketListed" 
 ),
 
-daily_price AS (
+daily_price AS ( -- pulling prices, /symbols organized by date, for all of the listed tokens on compound, these tokens have different addresses as their corresponding ctokens.
     WITH daily_price_with_gap AS (
         WITH allprices AS (
             SELECT
@@ -195,7 +97,7 @@ daily_price AS (
     
             AND minute > '2019-05-07 00:00'
             
-            UNION ALL
+            UNION ALL --pulling prices for COMP from aggergated dex prices
             
             SELECT
                 date_trunc('day', hour) AS time,
@@ -205,7 +107,7 @@ daily_price AS (
             WHERE contract_address = '\xc00e94cb662c3520282e6f5717214004a7f26888'
             AND hour < '2020-07-16 00:00'
            
-            UNION ALL
+            UNION ALL --joining the rows above with the price data for WBTC, presumably the reason it stands alone is that is the old WBTC and it is best practice ot seperate non-live token prices.
             
             SELECT
                 date_trunc('day', minute) AS time,
@@ -216,7 +118,7 @@ daily_price AS (
             AND minute > '2019-05-07 00:00'
         )
         
-        SELECT 
+        SELECT --window function: sorting by prices by symbol and then organizing by date
             time,
             symbol,
             lead(time, 1, now()) OVER (PARTITION BY symbol ORDER BY time ASC) AS next_time,
@@ -225,21 +127,21 @@ daily_price AS (
         GROUP BY 1,2
     ),
     
-    gs AS (
+    gs AS ( --speificying time window 
         SELECT
             generate_series('2019-05-07 00:00', NOW(), '1 day'::interval) AS time
     )
     
-    SELECT
+    SELECT -- pulling prices for listed markets with the time frame
         gs.time,
         symbol,
         price
     FROM daily_price_with_gap g
-    INNER JOIN gs ON g.time <= gs.time AND gs.time < g.next_time
+    INNER JOIN gs ON g.time <= gs.time AND gs.time < g.next_time --adding time window col 
 ),
 
 br_tx AS(
-    SELECT 
+    SELECT --calculating borrowed amounts from cerc20 table
         evt_block_time,
         evt_index,
         date_trunc('day', evt_block_time) AS time,
@@ -248,9 +150,9 @@ br_tx AS(
         0 AS repay,
         "totalBorrows" AS Total_Borrow
     FROM compound_v2."cErc20_evt_Borrow"
-    WHERE contract_address NOT IN ('\x158079ee67fce2f58472a96584a73c7ab9ac95c1', '\xf5dce57282a584d2746faf1593d3121fcac444dc')
-    UNION ALL
-    SELECT 
+    WHERE contract_address NOT IN ('\x158079ee67fce2f58472a96584a73c7ab9ac95c1', '\xf5dce57282a584d2746faf1593d3121fcac444dc') --excluding c'Augur' and cSAI -- older tokens that are historically irrelevent
+    UNION ALL 
+    SELECT --calculating borrowed amounts from cether_evt table
         evt_block_time,
         evt_index,
         date_trunc('day', evt_block_time) AS time,
@@ -261,7 +163,7 @@ br_tx AS(
     FROM compound_v2."cEther_evt_Borrow" 
     WHERE contract_address NOT IN ('\x158079ee67fce2f58472a96584a73c7ab9ac95c1', '\xf5dce57282a584d2746faf1593d3121fcac444dc')
     UNION ALL
-    SELECT 
+    SELECT --calculating borrowed amounts from cerc20 delegator table
         evt_block_time,
         evt_index,
         date_trunc('day', evt_block_time) AS time,
@@ -274,7 +176,7 @@ br_tx AS(
     
     UNION ALL
     
-    SELECT
+    SELECT --repeating the three source structure above to calculating borrowed amount repayed 
         evt_block_time,
         evt_index,
         date_trunc('day', evt_block_time) AS time,
@@ -309,7 +211,7 @@ br_tx AS(
 ),
     
 daily_BorrowRepay AS (
-    SELECT
+    SELECT --summing equity and debt
         time,
         contract_address,
         SUM(borrow) AS borrow,
@@ -323,7 +225,7 @@ loans AS (
         SELECT 
             contract_address,
             time,
-            MAX(evt_block_time) AS _maxtime
+            MAX(evt_block_time) AS _maxtime --organizing time col
         FROM br_tx
         GROUP BY 1,2
     ),
@@ -367,11 +269,11 @@ loans AS (
         contract_address,
         Total_Borrow
     FROM daily_TBorrow2 b
-    INNER JOIN gs ON b.time <= gs.time AND gs.time < b.next_time
+    INNER JOIN gs ON b.time <= gs.time AND gs.time < b.next_time --syncing it all up
 
 ),
 
-dailyMintRedeem AS (
+dailyMintRedeem AS ( -- deposits from the three table sources and then sorting data by listed market
     WITH mr_tx AS (    
         SELECT 
             date_trunc('day', evt_block_time) AS time,
@@ -436,7 +338,7 @@ dailyMintRedeem AS (
         WHERE contract_address NOT IN ('\x158079ee67fce2f58472a96584a73c7ab9ac95c1', '\xf5dce57282a584d2746faf1593d3121fcac444dc')
     )
 
-    SELECT
+    SELECT --daily sums for interest, depositing capital, widthdrawing capital, and total
         time,
         contract_address,
         SUM(deposit) AS dailyDeposit,
@@ -453,13 +355,13 @@ reserves AS (
             time,
             contract_address,
             lead(time, 1, now()) OVER (PARTITION BY contract_address ORDER BY time ASC) AS next_time,
-            SUM(dailyDeposit+dailyRedeem) OVER (PARTITION BY contract_address ORDER BY time) AS total_reserve
+            SUM(dailyDeposit+dailyRedeem) OVER (PARTITION BY contract_address ORDER BY time) AS total_reserve -- calculating total deposits by factoring in widthdraws
         FROM dailyMintRedeem
     ),
     
     gs AS (
         SELECT
-            generate_series('2019-05-07 00:00', NOW(), '1 day'::interval) AS time
+            generate_series('2019-05-07 00:00', NOW(), '1 day'::interval) AS time --is the redundent?
     )
     
     SELECT
@@ -470,7 +372,7 @@ reserves AS (
     INNER JOIN gs ON b.time <= gs.time AND gs.time < b.next_time
 ),
 
-interests AS (
+interests AS ( --interest for each listed market from the three sources...over time
     WITH ai_tx AS (
         SELECT 
             date_trunc('day', evt_block_time) AS time,
@@ -502,7 +404,7 @@ interests AS (
     GROUP BY 1,2
 ),
 
-liquidations AS (
+liquidations AS ( --debt defaults data with be multiplied with ctoken conversions later
     WITH liq_tx AS (
         SELECT 
             date_trunc('day', evt_block_time) AS time,
@@ -534,7 +436,7 @@ liquidations AS (
     GROUP BY 1,2
 ),
 
-incentives AS (
+incentives AS ( --incentives paid to users, !important for protocol strat! ... Anchor 
     WITH inc_tx AS (
         SELECT 
             date_trunc('day', evt_block_time) AS time,
@@ -545,7 +447,7 @@ incentives AS (
             -- "compBorrowIndex"/1e18 AS compBorrowIndex,
             -- evt_tx_hash
         FROM compound_v2."Unitroller_evt_DistributedBorrowerComp"
-        WHERE contract_address NOT IN ('\x158079ee67fce2f58472a96584a73c7ab9ac95c1', '\xf5dce57282a584d2746faf1593d3121fcac444dc')
+        WHERE contract_address NOT IN ('\x158079ee67fce2f58472a96584a73c7ab9ac95c1', '\xf5dce57282a584d2746faf1593d3121fcac444dc') 
         -- Removing Hack incentives so they don't mess with graphs
         AND NOT (
             evt_block_time BETWEEN '2021-09-29 00:00' AND  '2021-10-08 23:15'
@@ -592,7 +494,7 @@ incentives AS (
     LEFT JOIN daily_price p ON i.time = p.time AND p.symbol = 'COMP'
 ),
 
-resFactor AS (
+resFactor AS ( --COMPs cut of interest overtime
    WITH gap_ResFactor_tx AS (
         WITH ResFactor_tx AS (
             SELECT 
@@ -625,7 +527,7 @@ resFactor AS (
             
     days AS (
         SELECT DISTINCT
-            generate_series('2019-05-07'::TIMESTAMP, date_trunc('day', NOW()), '1 day') AS day, -- Generate all minutes since the first contract
+            generate_series('2019-05-07'::TIMESTAMP, date_trunc('day', NOW()), '1 day') AS day,
             contract_address
         FROM gap_ResFactor_tx
     )
@@ -639,42 +541,42 @@ resFactor AS (
 ),
 
 
-tokenskpi AS (
+tokenskpi AS ( --putting it all together!!! Cleaning up labels for graphs with "_" and from drawing all the subqueries 
     SELECT  
-        b.time AS Day,
+        b.time AS "Day",
         token AS "Token",
         price AS "Day Price",
-        COALESCE(dailyDeposit/10^t.decimals, 0) AS "Deposit (Native)",
-        COALESCE((dailyDeposit/10^t.decimals)*price, 0) AS "Deposit (USD)",
-        COALESCE(dailyRedeem/10^t.decimals, 0) AS "Redeem (Native)",
-        COALESCE((dailyRedeem/10^t.decimals)*price, 0) AS "Redeem (USD)",
-        COALESCE(borrow/10^t.decimals, 0) AS "Borrow (Native)",
-        COALESCE((borrow/10^t.decimals)*price, 0) AS "Borrow (USD)",
-        COALESCE(repay/10^t.decimals, 0) AS "Repay (Native)",
-        COALESCE((repay/10^t.decimals)*price, 0) AS "Repay (USD)",
+        COALESCE(dailyDeposit/10^t.decimals, 0) AS "Deposit (Native)", --using coalesce to handle any null values and multiplying the decimals referencing in the begining to accurately display deposits amounts in the naitive token
+        COALESCE((dailyDeposit/10^t.decimals)*price, 0) AS "Deposit (USD)", --multipling deposits by relevent price of the particular token
+        COALESCE(dailyRedeem/10^t.decimals, 0) AS "Redeem (Native)", --""
+        COALESCE((dailyRedeem/10^t.decimals)*price, 0) AS "Redeem (USD)", --""
+        COALESCE(borrow/10^t.decimals, 0) AS "Borrow (Native)", --""
+        COALESCE((borrow/10^t.decimals)*price, 0) AS "Borrow (USD)", --""
+        COALESCE(repay/10^t.decimals, 0) AS "Repay (Native)", --""
+        COALESCE((repay/10^t.decimals)*price, 0) AS "Repay (USD)", --""
         COALESCE(daily_liq/10^ctoken_decimals, 0) AS daily_liq_ctoken,
-        total_reserve/10^t.decimals AS "Outstanding Deposits (Native)",
-        (total_reserve/10^t.decimals)*price AS "Outstanding Deposits (USD)",
-        COALESCE(Total_Borrow/10^t.decimals, 0) AS "Outstanding Loans (Native)",
-        COALESCE((Total_Borrow/10^t.decimals)*price, 0) AS "Outstanding Loans (USD)",
-        dailyInterest/10^t.decimals AS "Interest (Native)",
-        (dailyInterest/10^t.decimals)*price AS "Interest (USD)",
-        COALESCE((dailyAmount/10^t.decimals)/NULLIF((dailyCtoken/10^t.cToken_Decimals),0),0) AS "cToken Convertion",
-        COALESCE((Total_Borrow/10^t.decimals)/NULLIF((total_reserve/10^t.decimals),0),0) AS "Utilization",
-        compPrice AS "COMP Price",
-        COALESCE(DailySupplyIncentive, 0) AS "Deposit Incentive (COMP)",
-        COALESCE(DailySupplyIncentiveUSD, 0) AS "Deposit Incentive (USD)",
-        COALESCE(DailyBorrowIncentive, 0) AS "Borrow Incentive (COMP)",
-        COALESCE(DailyBorrowIncentiveUSD, 0) AS "Borrow Incentive (USD)",
-        COALESCE(TotalSupplyIncentive, 0) AS "Aggregate Deposit Incentive (COMP)",
-        COALESCE(TotalSupplyIncentiveUSD, 0) AS "Aggregate Deposit Incentive (USD)",
-        COALESCE(TotalBorrowIncentive, 0) AS "Aggregate Borrow Incentive (COMP)",
-        COALESCE(TotalBorrowIncentiveUSD, 0) AS "Aggregate Borrow Incentive (USD)",
+        total_reserve/10^t.decimals AS "Outstanding Deposits (Native)", --""
+        (total_reserve/10^t.decimals)*price AS "Outstanding Deposits (USD)", --""
+        COALESCE(Total_Borrow/10^t.decimals, 0) AS "Outstanding Loans (Native)", --""
+        COALESCE((Total_Borrow/10^t.decimals)*price, 0) AS "Outstanding Loans (USD)",--""
+        dailyInterest/10^t.decimals AS "Interest (Native)", --""
+        (dailyInterest/10^t.decimals)*price AS "Interest (USD)", --""
+        COALESCE((dailyAmount/10^t.decimals)/NULLIF((dailyCtoken/10^t.cToken_Decimals),0),0) AS "cToken Convertion", --finding the ctoken ratio with division
+        COALESCE((Total_Borrow/10^t.decimals)/NULLIF((total_reserve/10^t.decimals),0),0) AS "Utilization", --finding the debt utilization of assets total borrowed/total deposited
+        compPrice AS "COMP Price",  
+        COALESCE(DailySupplyIncentive, 0) AS "Deposit Incentive (COMP)", --""
+        COALESCE(DailySupplyIncentiveUSD, 0) AS "Deposit Incentive (USD)",--""
+        COALESCE(DailyBorrowIncentive, 0) AS "Borrow Incentive (COMP)",--""
+        COALESCE(DailyBorrowIncentiveUSD, 0) AS "Borrow Incentive (USD)",--""
+        COALESCE(TotalSupplyIncentive, 0) AS "Aggregate Deposit Incentive (COMP)",--""
+        COALESCE(TotalSupplyIncentiveUSD, 0) AS "Aggregate Deposit Incentive (USD)",--""
+        COALESCE(TotalBorrowIncentive, 0) AS "Aggregate Borrow Incentive (COMP)",--""
+        COALESCE(TotalBorrowIncentiveUSD, 0) AS "Aggregate Borrow Incentive (USD)",--""
         ReserveFac AS "Reserve Factor",
-        (dailyInterest/10^t.decimals)*ReserveFac AS "Protocol Revenue (Native)",
-        (dailyInterest/10^t.decimals)*price*ReserveFac AS "Protocol Revenue (USD)",
-        (dailyInterest/10^t.decimals)*(1-ReserveFac) AS "Supply-Side Revenue (Native)",
-        (dailyInterest/10^t.decimals)*price*(1-ReserveFac) AS "Supply-Side Revenue (USD)"
+        (dailyInterest/10^t.decimals)*ReserveFac AS "Protocol Revenue (Native)",-- interest * the reserve factor (which is the % of interest comp takes)
+        (dailyInterest/10^t.decimals)*price*ReserveFac AS "Protocol Revenue (USD)", --above but with usd prices
+        (dailyInterest/10^t.decimals)*(1-ReserveFac) AS "Supply-Side Revenue (Native)", --the revenue for individuals
+        (dailyInterest/10^t.decimals)*price*(1-ReserveFac) AS "Supply-Side Revenue (USD)" --above but with USD prices
     FROM interests b
     LEFT JOIN loans a ON a.time = b.time AND a.contract_address = b.contract_address
     LEFT JOIN daily_BorrowRepay br ON br.time = b.time AND br.contract_address = b.contract_address
@@ -687,18 +589,18 @@ tokenskpi AS (
     LEFT JOIN resFactor r ON b.contract_address = r.contract_address AND b.time = r.time
     WHERE b.time BETWEEN '{{1 - Start Date Time}}' AND LEAST ('{{2 - Finish Date Time}}', NOW())
     AND compPrice IS NOT NULL
-),
+), -- all of the left joins are adding the subqueries created above on a speific col, all protocol data is joined at the contract addressses of listed markets, and prices are joined on date  
 
 tokenskpi2 AS (
     SELECT *,
-        COALESCE(daily_liq_ctoken*"cToken Convertion", 0) AS "Liquidation (Native)",
+        COALESCE(daily_liq_ctoken*"cToken Convertion", 0) AS "Liquidation (Native)", 
         COALESCE(daily_liq_ctoken*"cToken Convertion"*"Day Price", 0) AS "Liquidation (USD)"
     FROM tokenskpi
 ),
 
-tokenskpi3 AS (
+tokenskpi3 AS ( --everything summed up and final names for graph.
     SELECT 
-        Day,
+        "Day",
         SUM("Deposit (USD)") AS "Deposits (USD)",
         SUM("Redeem (USD)") AS "Redeems (USD)",
         SUM("Borrow (USD)") AS "Borrows (USD)",
@@ -719,37 +621,264 @@ tokenskpi3 AS (
         SUM("Protocol Revenue (USD)") AS "Protocol Revenue (USD)",
         SUM("Supply-Side Revenue (USD)") AS "Supply-Side Revenue (USD)"
     FROM tokenskpi2
-    GROUP BY Day,"COMP Price"
+    GROUP BY "Day","COMP Price"
 ),
 
-comp_price as (
-                Select
-                    *, 
-                    date_trunc('day', minute) AS cp_day
-                 FROM prices."usd"
-                WHERE symbol = 'COMP'
+COMP as (
+SELECT
+    "Day" as day,
+      "Outstanding Loans (USD)" as outstanding_loans_comp
+FROM tokenskpi3
+ORDER BY "Day" DESC
+
 ),
 
-MKR_price as (
-            Select
-                *, 
-                date_trunc('day', minute) AS mp_day
-            FROM prices."usd"
-            WHERE symbol = 'MKR'
+
+
+
+
+
+
+
+borrows AS (
+    
+    SELECT  day,
+            project,
+            token_symbol,
+            token_address, 
+            sum(amount) AS amount -- Net borrow per day
+    FROM
+    
+    (
+        SELECT  date_trunc('day', block_time) AS day,
+                project,
+                asset_address AS token_address,
+                asset_symbol AS token_symbol,
+                token_amount AS amount
+        FROM lending."borrow"
+        WHERE project IN ('MakerDAO', 'AAVE')
+
+        
+        UNION ALL
+        
+        SELECT  date_trunc('day', block_time) AS day,
+                project,
+                asset_address AS token_address,
+                asset_symbol AS token_symbol,
+                -token_amount AS amount
+        FROM lending."repay"
+        WHERE project IN ('MakerDAO', 'AAVE')
+
+    ) b
+   GROUP BY 1, 2, 3, 4
+   )
+
+, outstanding_token_amount AS (
+    SELECT  day,
+            project,
+            token_address,
+            SUM(amount) OVER (PARTITION BY project, token_address ORDER BY day) AS outstanding
+    FROM borrows
+    WHERE project IN ('MakerDAO', 'AAVE')
+    )
+    
+, per_day AS
+(
+    SELECT  date_trunc('day', block_time) AS day,
+            project,
+            asset_address,
+            SUM(token_amount) AS collateral_change
+    FROM lending."collateral_change"
+    GROUP BY 1, 2, 3
 )
 
+, daily_token_balance AS (
+    SELECT  day,
+            project,
+            asset_address,
+            SUM(collateral_change) OVER (PARTITION BY project, asset_address ORDER BY day) AS collateral_locked
+    FROM per_day
+   WHERE day BETWEEN '2021-11-10' AND '2022-03-28'
+)
+
+, usd_prices AS (
+    SELECT  date_trunc('day', minute) AS day,
+            contract_address AS asset_address,
+            AVG(price) AS price
+    FROM prices.usd 
+    WHERE contract_address IN (SELECT asset_address FROM daily_token_balance)
+AND minute BETWEEN '2021-11-10' AND '2022-03-28'
+    GROUP BY 1,2
+)
+, all_outstanding as 
+   (
+SELECT  b.day,
+        project,
+        SUM(outstanding*p.price) AS outstanding_usd_value
+FROM outstanding_token_amount b
+LEFT JOIN usd_prices p ON p.day = b.day AND p.asset_address = b.token_address
+WHERE b.day BETWEEN '2021-11-10' AND '2022-03-28'
+AND project IN ('MakerDAO', 'AAVE')
+GROUP BY 1, 2
+)
+
+, all_collateral as (
+SELECT  b.day,
+        project,
+        SUM(collateral_locked*p.price) AS locked_usd_value
+FROM        daily_token_balance b
+LEFT JOIN   usd_prices p ON p.day = b.day AND p.asset_address = b.asset_address
+WHERE b.day BETWEEN '2021-11-10' AND '2022-03-28'
+AND project IN ('MakerDAO', 'AAVE')
+GROUP BY 1, 2
+),
+
+
+
+
+
+
+
+
+
+
+
+erc20tmp AS
+(
+    select *,
+    symbol as symbol1
+    from erc20."tokens"
+),
+
+
+d AS
+(
+    select 
+        date_trunc('day', evt_block_time) as day,
+        sum("amount") as amt,
+        "reserve"
+    from aave_v2."LendingPool_evt_Deposit"
+    group by 1, 3
+),
+
+r AS (
+    select 
+        date_trunc('day', evt_block_time) as day,
+        sum("amount") as amt,
+        "reserve"
+    from aave_v2."LendingPool_evt_Withdraw"
+group by 1, 3
+),
+
+supply AS (
+    select
+        day,
+        token,
+        sum(sum(amt)) over (partition by token order by day)*avg(p.price) as outstanding
+    FROM (
+        SELECT
+            d.day,
+            sum(d.amt/10^decimals) AS amt,--deposit
+            t.symbol1 AS token
+        FROM d
+        LEFT JOIN erc20tmp t ON d."reserve" = t.contract_address
+        GROUP BY 1,3
+        UNION
+        SELECT 
+            r.day,
+            sum(-r.amt/10^decimals) AS amt,--withdraw
+            t.symbol1 AS token
+        FROM  r
+        LEFT JOIN erc20tmp t ON r."reserve" = t.contract_address
+        GROUP BY 1,3
+    ) net
+    LEFT JOIN prices.usd p ON net.day = p.minute
+    WHERE p.symbol = net.token
+    GROUP BY 1,2
+),
+
+s1 AS (
+    SELECT
+        day,
+        sum(outstanding) AS total_supply
+    FROM supply
+    GROUP BY 1
+),
+
+b AS (
+    SELECT
+        date_trunc('day', evt_block_time) AS day,
+        sum("amount") AS amt,
+        "reserve"
+    FROM aave_v2."LendingPool_evt_Borrow"
+    GROUP BY 1, 3
+),
+
+r2 AS (
+    SELECT 
+        date_trunc('day', evt_block_time) AS day,
+        sum("amount") AS amt,
+        "reserve"
+    FROM aave_v2."LendingPool_evt_Repay"
+    GROUP BY 1, 3
+),
+
+borrow AS (
+    SELECT
+        day,
+        token,
+        sum(sum(amt)) over (PARTITION BY token ORDER BY day)*avg(p.price) AS outstanding
+   FROM (
+        SELECT
+            b.day,
+            sum(b.amt/10^decimals) AS amt,--borrow
+            t.symbol1 as token
+        FROM b
+            LEFT JOIN erc20tmp t ON b."reserve" = t.contract_address
+        GROUP BY 1,3
+        UNION
+        SELECT
+            r2.day,
+            sum(-r2.amt/10^decimals) AS amt,--repay
+            t.symbol1 AS token
+        FROM r2
+            LEFT JOIN erc20tmp t ON r2."reserve" = t.contract_address
+        GROUP BY 1,3
+    ) net
+        LEFT JOIN prices.usd p ON net.day = p.minute
+    WHERE p.symbol = net.token
+    GROUP BY 1,2
+),
+
+b1 AS ( 
+    SELECT
+        a.day,
+        sum(a.outstanding) AS total_debt
+    FROM borrow a
+    GROUP BY 1
+),
+
+AAVE AS (
+    SELECT
+        s1.day,
+        b1.total_debt 
+    FROM s1
+        LEFT JOIN b1 ON s1.day = b1.day
+    WHERE s1.day BETWEEN '2021-11-10' AND '2022-04-01'
+    ORDER BY 1 DESC
+    )
+
+
+
 SELECT
-    cp.*,
-    mp.*,
-    Day,
-    "Outstanding Deposits (USD)",
-    "Outstanding Loans (USD)",
-    mkr_collateral,
-    mkr_debt
-FROM tokenskpi3 c
-LEFT JOIN mkr m on m.mkr_day = c.day
-LEFT JOIN mkr_price mp on mp_day = c.day
-LEFT JOIN comp_price cp on cp_day = c.day
-ORDER BY c.day DESC
-LIMIT 3
+    o.day,
+    o.project, 
+    y.total_debt as "Aave Debt",
+    outstanding_usd_value as "Maker Debt",
+    locked_usd_value,
+    z.outstanding_loans_comp as "COMP Debt"
+FROM all_outstanding o
+    LEFT JOIN COMP z on z.day = o.day
+    LEFT JOIN AAVE y on y.day = o.day
+    LEFT JOIN all_collateral c on o.day = c.day
 
